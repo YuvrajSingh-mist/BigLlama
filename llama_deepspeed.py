@@ -44,7 +44,7 @@ from deepspeed.accelerator import get_accelerator
 from datasets import load_dataset, concatenate_datasets
 
 # from google.colab import userdata
-HF_TOKEN = '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'
+HF_TOKEN = '...'
 
 tinystories = True
 fw = False
