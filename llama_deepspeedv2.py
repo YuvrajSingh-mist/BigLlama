@@ -82,16 +82,16 @@ class ModelArgs:
     #Hyperparameters
     
     epochs = 4
-    block_size = 128
+    block_size = 64
     batch_size = 128
-    embeddings_dims = 512
+    embeddings_dims = 768
     attn_dropout = 0.1
-    no_of_heads = 8 
+    no_of_heads = 12
     dropout = 0.1
     # epochs = 100
     val_epochs = 2
     max_lr = 6e-4
-    no_of_decoder_layers = 8 #IMP needs to be thoroughly calculated
+    no_of_decoder_layers = 12 #IMP needs to be thoroughly calculated
     weight_decay_optim = 0.1
     beta_1 = 0.9
     beta_2 = 0.95
@@ -103,10 +103,10 @@ class ModelArgs:
     dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 #     dtype = 'bfloat16'
     mqa_heads = 2
-    use_flash_attn = True
+    use_flash_attn = False #Not working
     use_compile = False
     use_liger = False
-
+    checkpoint_dir = '/kaggle/working/'
 
 
 def _save_snapshot(model, optimizer, scheduler, epoch, step):
@@ -268,8 +268,8 @@ class RotaryEmbeddings(nn.Module):
     def apply_rope(self, seq):
         batch_size, seq_len, embeds_dims = seq.shape
       
-        token_idx = torch.arange(0 , seq_len, device = self.device).unsqueeze(1)
-        positions = torch.arange(0 , embeds_dims, 2, device = self.device).unsqueeze(0)
+        token_idx = torch.arange(0 , seq_len, device = seq.device).unsqueeze(1)
+        positions = torch.arange(0 , embeds_dims, 2, device = seq.device).unsqueeze(0)
         # dims = torch.arange(1, self.embeddings_dims // 2,  dtype=torch.float32)
         theta = 10000 ** (-2 * (positions) / embeds_dims)
         angles = token_idx * theta
@@ -309,6 +309,7 @@ class MQA(nn.Module):
 
         # self.no_of_q_heads = no_of_heads // no_of_kv_heads
         # self.no_of_q_heads = no_of_q_heads
+        self.no_of_heads = ModelArgs.no_of_heads
         self.no_of_kv_heads = 2 # I want to have a kv for each pair of query heads 
         self.head_size = embeddings_dims // no_of_q_heads
         # self.kv_head_size = (embeddings_dims // self.no_of_kv_heads) * 2
@@ -324,18 +325,18 @@ class MQA(nn.Module):
         self.dropout = nn.Dropout(p = ModelArgs.attn_dropout)
         self.linear_layer = nn.Linear(in_features=self.head_size * self.no_of_kv_heads, out_features=embeddings_dims,  bias=False,  device = device)
         self.device = device
-        if(ModelArgs.use_flash_attn):
+        if(ModelArgs.use_flash_attn == True):
             self.multi_query = nn.ModuleList([nn.Linear(in_features=embeddings_dims, out_features=embeddings_dims,  bias=False,  device = self.device) for _ in range(self.no_of_kv_heads)])
         else:
             self.multi_query = nn.ModuleList([nn.Linear(in_features=embeddings_dims, out_features=self.head_size,  bias=False,  device = self.device) for _ in range(self.no_of_kv_heads)])
-        if(ModelArgs.use_flash_attn == False):
+        if(ModelArgs.use_flash_attn == True):
             self.proj = nn.Linear(embeddings_dims, 2*embeddings_dims,  bias=False,  device = self.device)
 
-    def scaled_dot_product(self, q, k, v, block_size):
+    def scaled_dot_product(self, q, device, k, v, block_size):
 
             # masked = torch.tril(torch.ones((block_size, block_size),  requires_grad=False,  device = self.device))
-            q = self.rotary(q)
-            masked_table = torch.tril(torch.ones((block_size, block_size),  requires_grad=False,  device = self.device))
+            q = self.rotary(q).to(device)
+            masked_table = torch.tril(torch.ones((block_size, block_size),  requires_grad=False,  device = self.device)).to(device)
             
             weights = q @ torch.transpose(k, dim0=-2, dim1=-1) * (k.shape[-1] ** -0.5)
             masked_values = weights.masked_fill(masked_table[: block_size, : block_size] == 0, float('-inf'))
@@ -343,14 +344,15 @@ class MQA(nn.Module):
             weights_normalized = self.dropout(weights_normalized)
             out = weights_normalized @ v
             return out
-    def flash_attn(q,k,v):
+    def flash_attn(self, q, device, k,v, batch, block_size, embeddings_dims):
         
-        q = self.rotary(q)
-        q = q.view(batch_size, block_size, self.no_of_heads, self.head_size).transpose(1, 2)
+        q = self.rotary(q).to(device)
+        q = q.view(batch, block_size, self.no_of_heads, self.head_size).transpose(1, 2)
         
         out = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, dropout_p=ModelArgs.dropout, is_causal=True
             )
+        out = out.transpose(1, 2).contiguous().view(batch, block_size, -1)
         return out
     def forward(self,x):
         # print("MQA: ", x.shape)
@@ -362,32 +364,32 @@ class MQA(nn.Module):
         # matrix = self.rotary_matrix(block_size)
 
 
-            key = self.key(x)
-            values = self.value(x)
+            key = self.key(x).to(x.device)
+            values = self.value(x).to(x.device)
             # print("Keys: ", key.shape)
             # print("Values: ", values.shape)
             # rotary_value = self.rotary(values)
-            rotary_key = self.rotary(key)
-            multi_query_concat = torch.cat([self.scaled_dot_product(query(x), rotary_key, values, block_size) for query in self.multi_query], dim=-1)
+            rotary_key = self.rotary(key).to(x.device)
+            multi_query_concat = torch.cat([self.scaled_dot_product(query(x), x.device, rotary_key, values, block_size) for query in self.multi_query], dim=-1)
             # print("Multi query: ", multi_query_concat.shape)
 
-            linear_layer= self.linear_layer(multi_query_concat)
+            linear_layer= self.linear_layer(multi_query_concat).to(x.device)
             # out = self.dropout(linear_layer)
             return linear_layer
         else:
-            qkv_proj = self.proj(x)
+            qkv_proj = self.proj(x).to(x.device)
             k, v = qkv_proj.chunk(2, dim=-1)
-            k = self.rotary(k)
+            k = self.rotary(k).to(x.device)
             # q = self.rotary(q)
             # q = q.view(batch_size, block_size, self.no_of_heads, self.head_size).transpose(1, 2)
-            k = k.view(batch_size, block_size, self.no_of_heads, self.head_size).transpose(1, 2)
-            v = v.view(batch_size, block_size, self.no_of_heads, self.head_size).transpose(1, 2)
+            k = k.view(batch, block_size, self.no_of_heads, self.head_size).transpose(1, 2)
+            v = v.view(batch, block_size, self.no_of_heads, self.head_size).transpose(1, 2)
             
-            out = torch.cat([self.flash_attn(x, rotary_key, values, block_size) for query in self.multi_query], dim=-1)
+            out = torch.cat([self.flash_attn(x, rotary_key, values, batch, block_size, embeddings_dims) for query in self.multi_query], dim=-1)
             # Properly merge heads
-            out = out.transpose(1, 2).contiguous().view(batch_size, block_size, -1)
             
-            linear_layer= self.linear_layer(multi_query_concat)
+            
+            linear_layer= self.linear_layer(out)
             # out = self.dropout(linear_layer)
             return linear_layer
 
@@ -599,7 +601,7 @@ def topk_sampling(model, prompt, device, max_length=50, top_k=50, temperature=1.
     generated_tokens = []
     ModelArgs.inference=True
     for _ in range(max_length):
-        with torch.no_grad(), torch.autocast(device_type=ModelArgs.device, dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             outputs = model.module(input_ids, inference=True)
             logits = outputs[:, -1, :]
             
@@ -652,29 +654,29 @@ def beam_search(model, tokenizer, prompt, beam_width=5, max_length=50, temperatu
 # device = "cuda" if torch.cuda.is_available() else "cpu"
 # device = "cpu"
 # ModelArgs.device = device
-model = Llama(device=ModelArgs.device, embeddings_dims=ModelArgs.embeddings_dims, block_size=ModelArgs.block_size, vocab_size=ModelArgs.vocab_size, dropout=ModelArgs.dropout)
-model = model.to(ModelArgs.device)
+# model = Llama(device=ModelArgs.device, embeddings_dims=ModelArgs.embeddings_dims, block_size=ModelArgs.block_size, vocab_size=ModelArgs.vocab_size, dropout=ModelArgs.dropout)
+# model = model.to(ModelArgs.device)
 
 # Printing a summary of the architecture
 # !pip install torchinfo
-from torchinfo import summary
-# idx, targets = get_batch('test')
-idx = torch.randint(
-        low=0,
-        high=ModelArgs.vocab_size,
-        size=(ModelArgs.batch_size, ModelArgs.block_size),
-        dtype=torch.long
-    )
-# sample_idx = random.randint(range(len(train_dataset)))
-# idx, targets = train_dataset[0]
-idx = idx.to(ModelArgs.device)
-# targets = targets.to(ModelArgs.device)
-summary(model=model,
-        input_data=idx,
-        # input_size=(ModelArgs.batch_size, ModelArgs.block_size, ModelArgs.embeddings_dims),
-        col_names=["input_size", "output_size", "num_params", "trainable"],
-        col_width=20,
-        row_settings=["var_names"])
+# from torchinfo import Mode, summary
+# # idx, targets = get_batch('test')
+# idx = torch.randint(
+#         low=0,
+#         high=ModelArgs.vocab_size,
+#         size=(ModelArgs.batch_size, ModelArgs.block_size),
+#         dtype=torch.long
+#     )
+# # sample_idx = random.randint(range(len(train_dataset)))
+# # idx, targets = train_dataset[0]
+# idx = idx.to(ModelArgs.device)
+# # targets = targets.to(ModelArgs.device)
+# summary(model=model,
+#         input_data=idx,
+#         # input_size=(ModelArgs.batch_size, ModelArgs.block_size, ModelArgs.embeddings_dims),
+#         col_names=["input_size", "output_size", "num_params", "trainable"],
+#         col_width=20,
+#         row_settings=["var_names"])
 
 
 def find_unused_parameters(model):
@@ -780,10 +782,10 @@ torch.set_float32_matmul_precision('high')
 
 # scaler = torch.amp.GradScaler(enabled=(ModelArgs.dtype == 'float16'))
 
-save_chechpoint_iter = 50
+save_chechpoint_iter = 1000
 total_iters = 20000
-eval_iters = 50
-eval_check = 100
+eval_iters = 200
+eval_check = 200
 warmup_iters = 700
 min_lr = 0.1 * ModelArgs.max_lr
 lr_decay_iters = 20000
@@ -821,9 +823,10 @@ def train():
     if device == 'cuda:0':  # Only rank 0 initializes WandB
         wandb.init(project='Llama-DeepSpeed-Pretrain')
 
-    torch.cuda.set_device(device)
- 
- 
+    # torch.cuda.set_device(device)
+    model = Llama(device=None, embeddings_dims=ModelArgs.embeddings_dims, block_size=ModelArgs.block_size, vocab_size=ModelArgs.vocab_size, dropout=ModelArgs.dropout)
+    
+    # model = model.to(device)
 
     # torch.set_default_device('cuda')
     # train_dataloader = prepare_dataset(ModelArgs.batch_size)
@@ -848,8 +851,7 @@ def train():
 # )
     print("wand initialized")
     
-    model = Llama(embeddings_dims=ModelArgs.embeddings_dims, block_size=ModelArgs.block_size, vocab_size=ModelArgs.vocab_size, dropout=ModelArgs.dropout, device=device)
-    
+
     # print(f"Model on device {device} is ready")
     print(f"Model on device {device} is ready")
     
@@ -865,12 +867,12 @@ def train():
     model, optimizer, _, _ = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
-        config='/content/ds_config.json'  
+        config='/kaggle/input/config34/ds_config.json'  
     )
-
+    print("Model device: ", model.device)
 
     # model = torch.compile(model)
-    model = model.to(device)
+    # model = model.to(device)
     
     # model = DDP(model, device_ids=[device])
 
@@ -905,24 +907,27 @@ def train():
                 total_batches = 0 
                 # batch = next(val_loader_iterator)
                 # for batch in loader:  # Loop through DataLoader batches
-                idx = batch['input_ids'].to(device)
-                targets = batch['labels'].to(device)
-                # token_count += len(idx)
-                # idx = idx.to(device)
-                # targets = targets.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    if(ModelArgs.use_liger == False):
-                      logits = model(idx, targets)
-                      batch_size, block_size, embeddings_dims = logits.shape
-                      logits = logits.view(batch_size * block_size, embeddings_dims)  # Flatten tokens
-                      targets = targets.view(batch_size * block_size)
+                idx = batch['input_ids']
+                targets = batch['labels']
+                idx = idx.to(device)
+                targets = targets.to(device)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    
+                    if(ModelArgs.use_liger == True):
+                        loss = model(idx, targets)
 
-                      loss = F.cross_entropy(logits, targets, ignore_index=tokenizer.pad_token_id)
-
-                      total_loss += loss.item()
-                      total_batches += 1
                     else:
-                      loss = model(idx, targets)
+                        
+                        logits = model(idx)
+                        batch_size, block_size, embeddings_dims = logits.shape
+                        logits = logits.view(batch_size * block_size, embeddings_dims)
+                        targets = targets.view(batch_size * block_size)
+
+                        loss = torch.nn.functional.cross_entropy(logits, targets, ignore_index=tokenizer.pad_token_id)
+
+                total_loss += loss.item()
+                total_batches += 1
+
             # Compute mean loss for this epoch
             epoch_loss = total_loss / total_batches if total_batches > 0 else 0.0
             epoch_losses.append(epoch_loss)
@@ -941,8 +946,8 @@ def train():
     model.train()
     count = 0
    
-    train_dataloader = prepare_dataset('train', device, ModelArgs.batch_size)
-    val_loader= prepare_dataset('val', device, ModelArgs.batch_size)
+    train_dataloader = prepare_dataset('train', model.device, ModelArgs.batch_size)
+    val_loader= prepare_dataset('val', model.device, ModelArgs.batch_size)
     # for step in tqdm(range(total_iters)):
     # for epoch in range(ModelArgs.epochs):
         # torch.cuda.synchronize() 
@@ -986,36 +991,38 @@ def train():
         # all_gpus_avg_val_loss = None
         # every once in a while evaluate the loss on train and val sets
         if (step  % eval_iters == 0 and step != 0) or step == total_iters - 1:
-            losses = estimate_loss( val_loader, val_data_iterator, 'cuda')
-            # avg_train_loss = losses['train']
-            avg_val_loss = losses['val']
-            # print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            # if device == 0:  # Only print on main process
-            print(f"[GPU {device}] | Step: {step} / {total_iters} | Val Loss: {losses['val']:.4f}")
-
-            avg_val_loss = torch.Tensor([losses['val']]).to(device)
-
-            # model.all_reduce(avg_val_loss)
-
-            torch.distributed.reduce(avg_val_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
-            if device == 'cuda:0':
-                # all_gpus_avg_train_loss = avg_train_loss / world_size
-                # print(f"All_GPUs_Train_losses: {all_gpus_avg_train_loss.item():.4f}")
+                losses = estimate_loss( val_loader, val_data_iterator, model.device)
+                # avg_train_loss = losses['train']
+                avg_val_loss = losses['val']
+                # print(avg_val_loss)
+                avg_val_loss = torch.tensor([avg_val_loss]).to(model.device)
+                # print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+                # if device == 0:  # Only print on main process
+                print(f"[GPU {device}] | Step: {step} / {total_iters} | Val Loss: {losses['val']:.4f}")
+                # print(f"[GPU {device}] | Epoch {epoch}/{ModelArgs.epochs}| |Step: {step} | Train Loss: {losses['train']:.4f}")
+                    # print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+                    # Log training loss more frequently
+                    # Aggregate average loss across all GPUs
+                # avg_train_loss = torch.Tensor([losses['train']]).to(device)
+                avg_val_loss = torch.Tensor([losses['val']]).to(model.device)
+                torch.distributed.reduce(avg_val_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
+                # torch.distributed.reduce(avg_val_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
+                
+                # if device == 'cuda:0':
+                    # all_gpus_avg_train_loss = avg_train_loss / world_size
+                    # print(f"All_GPUs_Train_losses: {all_gpus_avg_train_loss.item():.4f}")
                 all_gpus_avg_val_loss = avg_val_loss / world_size
-                print(f"All_GPUs_Val_losses: {all_gpus_avg_val_loss.item():.4f}")
-                
- 
-                
+                print(f"Val Loss: {all_gpus_avg_val_loss.item():.4f}")
+    
+                perplexity = torch.exp(torch.tensor(all_gpus_avg_val_loss.item()))  # Calculate perplexity
+
+                # if device == 0:
                 wandb.log({
-                    # "Learning Rate": optimizer.param_groups[0]['lr'],
-                    # "All_GPUs_Train_losses": all_gpus_avg_train_loss,
-                    "All_GPUs_Val_losses": all_gpus_avg_val_loss,
-                    # "training_step_loss": losses['train'],
-                    "val_step_loss": losses['val'],
-                    # "Step": step,
-                    # "Epoch": epoch
-                })
-            
+                        "All GPU Val_Loss": all_gpus_avg_val_loss.item(),
+                        "Val Perplexity": perplexity.item(),
+                        "Total Tokens Processed": token_count,
+                        "Step": step,
+                    })
             
         
         #Loading a checkpoint
@@ -1026,17 +1033,17 @@ def train():
             
         #     _save_snapshot(epoch=epoch, model=model, optimizer=optimizer, step=step)
 
-        if step % save_chechpoint_iter == 0 and device == 0 and step != 0:
+        if step % save_chechpoint_iter == 0  and step != 0:
             print(f"Saving the model checkpoint for step: {step}")
             # _save_snapshot(model, optimizer, None, None, step)
-              # [MODIFIED] DeepSpeed checkpointing
+
             model.save_checkpoint(
-              save_dir=f"checkpoints/step_{step}",
+              save_dir=f"{ModelArgs.checkpoint_dir}step_{step}",
               client_state={'step': step}
           )
         
         accumulated_loss = 0.0
-        
+        torch.cuda.set_device(model.device)
         
         optimizer.zero_grad(set_to_none=True)
         # for micro_step in range(gradient_accumulation_steps):
@@ -1045,11 +1052,18 @@ def train():
         except StopIteration:
             train_data_iterator = iter(train_dataloader)
             batch = next(train_data_iterator)
-        
-        idx = batch['input_ids'].to(device)
-        targets = batch['labels'].to(device)
-        token_count += len(idx)
-        with torch.autocast(device_type=ModelArgs.device, dtype=torch.bfloat16):
+            # print("Here: ", model.device)
+        print("Before: ", batch['input_ids'].device)
+        print("Before: ", batch['labels'].device)
+        idx = batch['input_ids'].to(model.device)
+        targets = batch['labels'].to(model.device)
+        # token_count += len(idx)
+        # idx = idx.to(device)
+        # targets = targets.to(device)
+        print("After: ", idx.device)
+        print("After: ", targets.device)
+        token_count += (len(idx) * ModelArgs.batch_size)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
           if(ModelArgs.use_liger == True):
             loss = model(idx, targets)
 
@@ -1122,18 +1136,28 @@ def train():
         # scaler.update()
 
         torch.cuda.synchronize() 
+        if(step % 10 == 0):
+            get_accelerator().empty_cache()
         # model.all_reduce(accumulated_loss)
         torch.distributed.reduce(accumulated_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
+        accumulated_loss /= world_size
+
         if(device == 'cuda:0'):
+
+            perplexity = torch.exp(torch.tensor(accumulated_loss.item()))  # Calculate perplexity
+            # if(device == 0):
             wandb.log({
-                    "Learning Rate":  optimizer.param_groups[0]['lr'],
-                    "All_GPUs_Train_losses": accumulated_loss.item(),
-                   
-                    "Step": step,
-                    
-                    
-                })
-        
+                        "Learning Rate": optimizer.param_groups[0]['lr'],
+                        "Train_Loss": accumulated_loss.item(),
+                        # "Train loss": loss.item(),
+                        "Train Perplexity": perplexity.item(),
+                        "Total Tokens Processed": token_count,
+                        "Step": step,
+                        # "Gradient Norm": total_norm_before.item(),
+                        # "Epoch": epoch
+                        
+            })
+
         if device == 'cuda:0' and step % 200 == 0 and step != 0:
             count = 1
             while(count):  
