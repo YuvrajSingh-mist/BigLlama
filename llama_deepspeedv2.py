@@ -1013,14 +1013,14 @@ def train():
                 # if device == 'cuda:0':
                     # all_gpus_avg_train_loss = avg_train_loss / world_size
                     # print(f"All_GPUs_Train_losses: {all_gpus_avg_train_loss.item():.4f}")
-                all_gpus_avg_val_loss = avg_val_loss / world_size
-                print(f"Val Loss: {all_gpus_avg_val_loss.item():.4f}")
+                # all_gpus_avg_val_loss = avg_val_loss / world_size
+                print(f"Val Loss: {avg_val_loss.item():.4f}")
     
-                perplexity = torch.exp(torch.tensor(all_gpus_avg_val_loss.item()))  # Calculate perplexity
+                perplexity = torch.exp(torch.tensor(avg_val_loss.item()))  # Calculate perplexity
 
                 # if device == 0:
                 wandb.log({
-                        "All GPU Val_Loss": all_gpus_avg_val_loss.item(),
+                        "All GPU Val_Loss": avg_val_loss.item(),
                         "Val Perplexity": perplexity.item(),
                         "Total Tokens Processed": token_count,
                         "Step": step,
@@ -1142,7 +1142,7 @@ def train():
             get_accelerator().empty_cache()
         # model.all_reduce(accumulated_loss)
         torch.distributed.reduce(accumulated_loss, dst=0, op=torch.distributed.ReduceOp.SUM)
-        accumulated_loss /= world_size
+        # accumulated_loss /= world_size
 
         if(device == 'cuda:0'):
 
@@ -1150,7 +1150,7 @@ def train():
             # if(device == 0):
             wandb.log({
                         "Learning Rate": optimizer.param_groups[0]['lr'],
-                        "Train_Loss": accumulated_loss.item(),
+                        "All GPU Train_Loss": accumulated_loss.item(),
                         # "Train loss": loss.item(),
                         "Train Perplexity": perplexity.item(),
                         "Total Tokens Processed": token_count,
@@ -1164,7 +1164,7 @@ def train():
             count = 1
             while(count):  
                 prompt = "Once upon a time"
-                generated_text = topk_sampling(model, prompt, max_length=50, top_k=50, temperature=1.0, device=device)
+                generated_text = topk_sampling(model, prompt, max_length=50, top_k=50, temperature=1.0, device=model.device)
     
       
                 print(f" Step: {step} | Generated Text: {generated_text}")
