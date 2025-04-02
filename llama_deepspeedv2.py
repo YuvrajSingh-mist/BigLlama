@@ -45,7 +45,7 @@ from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 from datasets import load_dataset, concatenate_datasets
 
 # from google.colab import userdata
-HF_TOKEN = '...'
+HF_TOKEN = ''
 
 tinystories = True
 fw = False
@@ -651,6 +651,8 @@ def beam_search(model, tokenizer, prompt, beam_width=5, max_length=50, temperatu
     best_sequence = beam_sequences[0]
     return tokenizer.decode(best_sequence, skip_special_tokens=True)
 
+
+#NOTE This may lead to mmeory exhaUSTED SO BE CAREFUL TO USE ONLY ONCE, CANCEL THE RUN AND THEN RUN AGAIN AFTER YOU HAVE NOTED OWN THE MODEL SIZE
 # device = "cuda" if torch.cuda.is_available() else "cpu"
 # device = "cpu"
 # ModelArgs.device = device
