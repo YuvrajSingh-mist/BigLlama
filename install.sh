@@ -14,3 +14,4 @@ pip install liger-kernel
 pip install jiwer
 pip install soundfile
 pip install librosa
+pip install deepspeed
