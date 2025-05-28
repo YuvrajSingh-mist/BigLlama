@@ -46,7 +46,7 @@ from termcolor import colored
 from datasets import load_dataset, concatenate_datasets
 
 # from google.colab import userdata
-HF_TOKEN = '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'
+HF_TOKEN = '...'
 
 tinystories = False
 fw = True
